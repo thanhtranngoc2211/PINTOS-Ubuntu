@@ -6,11 +6,11 @@
 
 #define BUFFER_CACHE_SIZE 64
 
-struct buffer_cache_entry_t
+struct buffer_cache_entry
 {
     bool occupied; // true only if this entry is valid cache entry
 
-    block_sector_t disk_sector;
+    block_sector disk_sector;
     uint8_t buffer[BLOCK_SECTOR_SIZE];
 
     bool dirty;  // dirty bit
@@ -18,7 +18,7 @@ struct buffer_cache_entry_t
 };
 
 /* Buffer cache entries. */
-static struct buffer_cache_entry_t cache[BUFFER_CACHE_SIZE];
+static struct buffer_cache_entry cache[BUFFER_CACHE_SIZE];
 
 /* A global lock for synchronizing buffer cache operations. */
 static struct lock buffer_cache_lock;
@@ -40,7 +40,7 @@ void buffer_cache_init(void)
  * Must be called with the lock held.
  */
 static void
-buffer_cache_flush(struct buffer_cache_entry_t *entry)
+buffer_cache_flush(struct buffer_cache_entry *entry)
 {
     ASSERT(lock_held_by_current_thread(&buffer_cache_lock));
     ASSERT(entry != NULL && entry->occupied == true);
@@ -72,8 +72,8 @@ void buffer_cache_close(void)
  * Lookup the cache entry, and returns the pointer of buffer_cache_entry_t,
  * or NULL in case of cache miss. (simply traverse the cache entries)
  */
-static struct buffer_cache_entry_t *
-buffer_cache_lookup(block_sector_t sector)
+static struct buffer_cache_entry *
+buffer_cache_lookup(block_sector sector)
 {
     size_t i;
     for (i = 0; i < BUFFER_CACHE_SIZE; ++i)
@@ -94,7 +94,7 @@ buffer_cache_lookup(block_sector_t sector)
  * If there is an unoccupied slot already, return it.
  * Otherwise, some entry should be evicted by the clock algorithm.
  */
-static struct buffer_cache_entry_t *
+static struct buffer_cache_entry *
 buffer_cache_evict(void)
 {
     ASSERT(lock_held_by_current_thread(&buffer_cache_lock));
@@ -122,7 +122,7 @@ buffer_cache_evict(void)
     }
 
     // evict cache[clock]
-    struct buffer_cache_entry_t *slot = &cache[clock];
+    struct buffer_cache_entry *slot = &cache[clock];
     if (slot->dirty)
     {
         // write back into disk
@@ -133,11 +133,11 @@ buffer_cache_evict(void)
     return slot;
 }
 
-void buffer_cache_read(block_sector_t sector, void *target)
+void buffer_cache_read(block_sector sector, void *target)
 {
     lock_acquire(&buffer_cache_lock);
 
-    struct buffer_cache_entry_t *slot = buffer_cache_lookup(sector);
+    struct buffer_cache_entry *slot = buffer_cache_lookup(sector);
     if (slot == NULL)
     {
         // cache miss: need eviction.
@@ -158,11 +158,11 @@ void buffer_cache_read(block_sector_t sector, void *target)
     lock_release(&buffer_cache_lock);
 }
 
-void buffer_cache_write(block_sector_t sector, const void *source)
+void buffer_cache_write(block_sector sector, const void *source)
 {
     lock_acquire(&buffer_cache_lock);
 
-    struct buffer_cache_entry_t *slot = buffer_cache_lookup(sector);
+    struct buffer_cache_entry *slot = buffer_cache_lookup(sector);
     if (slot == NULL)
     {
         // cache miss: need eviction.
