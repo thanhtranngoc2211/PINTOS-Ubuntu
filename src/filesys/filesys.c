@@ -22,7 +22,7 @@ void filesys_init(bool format)
     PANIC("No file system device found, can't initialize file system.");
 
   // ADDED
-  init_cache();
+  buffer_cache_init();
   // END
 
   inode_init();
@@ -39,7 +39,7 @@ void filesys_init(bool format)
 void filesys_done(void)
 {
   // ADDED
-  write_back(true);
+  buffer_cache_close();
   // END
   free_map_close();
 }

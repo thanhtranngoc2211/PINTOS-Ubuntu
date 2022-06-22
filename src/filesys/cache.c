@@ -1,170 +1,185 @@
+#include <debug.h>
+#include <string.h>
 #include "filesys/cache.h"
 #include "filesys/filesys.h"
-#include "threads/malloc.h"
-#include "threads/thread.h"
 #include "threads/synch.h"
 
-void init_entry(int idx)
-{
-    cache_array[idx].is_free = true;
-    cache_array[idx].open_cnt = 0;
-    cache_array[idx].dirty = false;
-    cache_array[idx].accessed = false;
-}
+#define BUFFER_CACHE_SIZE 64
 
-void init_cache(void)
+struct buffer_cache_entry_t
 {
-    int i;
-    lock_init(&cache_lock);
-    for (i = 0; i < CACHE_MAX_SIZE; i++)
-        init_entry(i);
+    bool occupied; // true only if this entry is valid cache entry
 
-    thread_create("cache_writeback", 0, func_periodic_writer, NULL);
-}
+    block_sector_t disk_sector;
+    uint8_t buffer[BLOCK_SECTOR_SIZE];
 
-int get_cache_entry(block_sector_t disk_sector)
+    bool dirty;  // dirty bit
+    bool access; // reference bit, for clock algorithm
+};
+
+/* Buffer cache entries. */
+static struct buffer_cache_entry_t cache[BUFFER_CACHE_SIZE];
+
+/* A global lock for synchronizing buffer cache operations. */
+static struct lock buffer_cache_lock;
+
+void buffer_cache_init(void)
 {
-    int i;
-    for (i = 0; i < CACHE_MAX_SIZE; i++)
+    lock_init(&buffer_cache_lock);
+
+    // initialize entries
+    size_t i;
+    for (i = 0; i < BUFFER_CACHE_SIZE; ++i)
     {
-        if (cache_array[i].disk_sector == disk_sector)
+        cache[i].occupied = false;
+    }
+}
+
+/**
+ * An internal method for flushing back the cache entry into disk.
+ * Must be called with the lock held.
+ */
+static void
+buffer_cache_flush(struct buffer_cache_entry_t *entry)
+{
+    ASSERT(lock_held_by_current_thread(&buffer_cache_lock));
+    ASSERT(entry != NULL && entry->occupied == true);
+
+    if (entry->dirty)
+    {
+        block_write(fs_device, entry->disk_sector, entry->buffer);
+        entry->dirty = false;
+    }
+}
+
+void buffer_cache_close(void)
+{
+    // flush buffer cache entries
+    lock_acquire(&buffer_cache_lock);
+
+    size_t i;
+    for (i = 0; i < BUFFER_CACHE_SIZE; ++i)
+    {
+        if (cache[i].occupied == false)
+            continue;
+        buffer_cache_flush(&(cache[i]));
+    }
+
+    lock_release(&buffer_cache_lock);
+}
+
+/**
+ * Lookup the cache entry, and returns the pointer of buffer_cache_entry_t,
+ * or NULL in case of cache miss. (simply traverse the cache entries)
+ */
+static struct buffer_cache_entry_t *
+buffer_cache_lookup(block_sector_t sector)
+{
+    size_t i;
+    for (i = 0; i < BUFFER_CACHE_SIZE; ++i)
+    {
+        if (cache[i].occupied == false)
+            continue;
+        if (cache[i].disk_sector == sector)
         {
-            if (!cache_array[i].is_free)
-            {
-                return i;
-            }
+            // cache hit.
+            return &(cache[i]);
         }
     }
-
-    return -1;
+    return NULL; // cache miss
 }
 
-int get_free_entry(void)
+/**
+ * Obtain a free cache entry slot.
+ * If there is an unoccupied slot already, return it.
+ * Otherwise, some entry should be evicted by the clock algorithm.
+ */
+static struct buffer_cache_entry_t *
+buffer_cache_evict(void)
 {
-    int i;
-    for (i = 0; i < CACHE_MAX_SIZE; i++)
-    {
-        if (cache_array[i].is_free == true)
-        {
-            cache_array[i].is_free = false;
-            return i;
-        }
-    }
+    ASSERT(lock_held_by_current_thread(&buffer_cache_lock));
 
-    return -1;
-}
-
-int access_cache_entry(block_sector_t disk_sector, bool dirty)
-{
-    lock_acquire(&cache_lock);
-
-    int idx = get_cache_entry(disk_sector);
-    if (idx == -1)
-        idx = replace_cache_entry(disk_sector, dirty);
-    else
-    {
-        cache_array[idx].open_cnt++;
-        cache_array[idx].accessed = true;
-        cache_array[idx].dirty |= dirty;
-    }
-
-    lock_release(&cache_lock);
-    return idx;
-}
-
-int replace_cache_entry(block_sector_t disk_sector, bool dirty)
-{
-    int idx = get_free_entry();
-    int i = 0;
-    if (idx == -1) // cache is full
-    {
-        for (i = 0;; i = (i + 1) % CACHE_MAX_SIZE)
-        {
-            // cache is in use
-            if (cache_array[i].open_cnt > 0)
-                continue;
-
-            // second chance
-            if (cache_array[i].accessed == true)
-                cache_array[i].accessed = false;
-
-            // evict it
-            else
-            {
-                // write back
-                if (cache_array[i].dirty == true)
-                {
-                    block_write(fs_device, cache_array[i].disk_sector,
-                                &cache_array[i].block);
-                }
-
-                init_entry(i);
-                idx = i;
-                break;
-            }
-        }
-    }
-
-    cache_array[idx].disk_sector = disk_sector;
-    cache_array[idx].is_free = false;
-    cache_array[idx].open_cnt++;
-    cache_array[idx].accessed = true;
-    cache_array[idx].dirty = dirty;
-    block_read(fs_device, cache_array[idx].disk_sector, &cache_array[idx].block);
-
-    return idx;
-}
-
-void func_periodic_writer(void *aux UNUSED)
-{
+    // clock algorithm
+    static size_t clock = 0;
     while (true)
     {
-        timer_sleep(4 * TIMER_FREQ);
-        write_back(false);
+        if (cache[clock].occupied == false)
+        {
+            // found an empty slot -- use it
+            return &(cache[clock]);
+        }
+
+        if (cache[clock].access)
+        {
+            // give a second chance
+            cache[clock].access = false;
+        }
+        else
+            break;
+
+        clock++;
+        clock %= BUFFER_CACHE_SIZE;
     }
-}
 
-void write_back(bool clear)
-{
-    int i;
-    lock_acquire(&cache_lock);
-
-    for (i = 0; i < CACHE_MAX_SIZE; i++)
+    // evict cache[clock]
+    struct buffer_cache_entry_t *slot = &cache[clock];
+    if (slot->dirty)
     {
-        if (cache_array[i].dirty == true)
-        {
-            block_write(fs_device, cache_array[i].disk_sector, &cache_array[i].block);
-            cache_array[i].dirty = false;
-        }
-
-        // clear cache line (filesys done)
-        if (clear)
-        {
-            init_entry(i);
-        }
+        // write back into disk
+        buffer_cache_flush(slot);
     }
 
-    lock_release(&cache_lock);
+    slot->occupied = false;
+    return slot;
 }
 
-void func_read_ahead(void *aux)
+void buffer_cache_read(block_sector_t sector, void *target)
 {
-    block_sector_t disk_sector = *(block_sector_t *)aux;
-    lock_acquire(&cache_lock);
+    lock_acquire(&buffer_cache_lock);
 
-    int idx = get_cache_entry(disk_sector);
+    struct buffer_cache_entry_t *slot = buffer_cache_lookup(sector);
+    if (slot == NULL)
+    {
+        // cache miss: need eviction.
+        slot = buffer_cache_evict();
+        ASSERT(slot != NULL && slot->occupied == false);
 
-    // need eviction
-    if (idx == -1)
-        replace_cache_entry(disk_sector, false);
+        // fill in the cache entry.
+        slot->occupied = true;
+        slot->disk_sector = sector;
+        slot->dirty = false;
+        block_read(fs_device, sector, slot->buffer);
+    }
 
-    lock_release(&cache_lock);
-    free(aux);
+    // copy the buffer data into memory.
+    slot->access = true;
+    memcpy(target, slot->buffer, BLOCK_SECTOR_SIZE);
+
+    lock_release(&buffer_cache_lock);
 }
 
-void ahead_reader(block_sector_t disk_sector)
+void buffer_cache_write(block_sector_t sector, const void *source)
 {
-    block_sector_t *arg = malloc(sizeof(block_sector_t));
-    *arg = disk_sector + 1; // next block
-    thread_create("cache_read_ahead", 0, func_read_ahead, arg);
+    lock_acquire(&buffer_cache_lock);
+
+    struct buffer_cache_entry_t *slot = buffer_cache_lookup(sector);
+    if (slot == NULL)
+    {
+        // cache miss: need eviction.
+        slot = buffer_cache_evict();
+        ASSERT(slot != NULL && slot->occupied == false);
+
+        // fill in the cache entry.
+        slot->occupied = true;
+        slot->disk_sector = sector;
+        slot->dirty = false;
+        block_read(fs_device, sector, slot->buffer);
+    }
+
+    // copy the data form memory into the buffer cache.
+    slot->access = true;
+    slot->dirty = true;
+    memcpy(slot->buffer, source, BLOCK_SECTOR_SIZE);
+
+    lock_release(&buffer_cache_lock);
 }
